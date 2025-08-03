@@ -1,4 +1,3 @@
-# .github/workflows/build-android-python.yml
 name: Build Python 3.11 for Android (aarch64)
 
 on:
@@ -10,14 +9,16 @@ on:
 
 env:
   PYTHON_VER:   3.11.10
-  NDK_VER:      r27d
+  NDK_VER:      27.0.12479018
   ZLIB_VER:     1.3.1
   OPENSSL_VER:  3.5.1
   LIBRESSL_VER: 4.1.0
   ANDROID_API:  34
+  PREFIX:       /opt/android-python
+  NDK_ROOT:     /opt/android-ndk
   SRC_DIR:      ${{ github.workspace }}/src
+  BUILD_DIR:    ${{ github.workspace }}/build
   OUT_DIR:      ${{ github.workspace }}/out
-  HOST_PY:      ${{ github.workspace }}/src/Python-3.11.10/host-out/bin/python3
 
 jobs:
   build:
@@ -29,95 +30,131 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev zlib1g-dev \
-            libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm \
-            libncurses5-dev libncursesw5-dev xz-utils tk-dev libffi-dev \
-            liblzma-dev git libgdbm-dev libdb-dev libexpat1-dev unzip
+          sudo apt-get install -y build-essential \
+            libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+            wget curl llvm libncurses5-dev libncursesw5-dev xz-utils tk-dev \
+            libffi-dev liblzma-dev git libgdbm-dev libdb-dev libexpat1-dev \
+            unzip ninja-build
 
-      # 1) 下载源码
+      # 1) 下载并解压所有源码
       - name: Download sources
         run: |
           mkdir -p "$SRC_DIR"
           cd "$SRC_DIR"
-          wget -q https://www.python.org/ftp/python/${PYTHON_VER}/Python-${PYTHON_VER}.tar.xz
-          wget -q https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz
-          wget -q https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz
-          wget -q https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-${LIBRESSL_VER}.tar.gz
-          for f in *.tar.*; do tar -xf "$f"; done
+          wget --retry-connrefused --waitretry=2 -t 10 -q \
+            https://www.python.org/ftp/python/${PYTHON_VER}/Python-${PYTHON_VER}.tar.xz
+          wget --retry-connrefused --waitretry=2 -t 10 -q \
+            https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz
+          wget --retry-connrefused --waitretry=2 -t 10 -q \
+            https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz
+          wget --retry-connrefused --waitretry=2 -t 10 -q \
+            https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-${LIBRESSL_VER}.tar.gz
+          tar -xf Python-${PYTHON_VER}.tar.xz
+          tar -xf zlib-${ZLIB_VER}.tar.gz
+          tar -xf openssl-${OPENSSL_VER}.tar.gz
+          tar -xf libressl-${LIBRESSL_VER}.tar.gz
 
-      # 2) 安装 NDK
+      # 2) Android NDK
       - name: Install Android NDK
         run: |
+          mkdir -p "$NDK_ROOT"
           cd /tmp
-          wget -q https://googledownloads.cn/android/repository/android-ndk-${NDK_VER}-linux.zip
-          unzip -q android-ndk-${NDK_VER}-linux.zip
-          sudo mv android-ndk-${NDK_VER} /opt/android-ndk
-          echo "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+          wget --retry-connrefused --waitretry=2 -t 10 -q \
+               https://googledownloads.cn/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d/* "$NDK_ROOT"
+          echo "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      # 3) zlib
+      # 3) 交叉编译 zlib
       - name: Build zlib
         run: |
           cd "$SRC_DIR/zlib-${ZLIB_VER}"
-          mkdir build && cd build
+          mkdir -p build out
+          cd build
           ../configure --prefix="$(pwd)/../out"
-          sed -i 's|^CC=.*|CC=aarch64-linux-android${ANDROID_API}-clang|' Makefile
-          sed -i 's|^AR=.*|AR=llvm-ar|' Makefile
-          sed -i 's|^RANLIB=.*|RANLIB=llvm-ranlib|' Makefile
-          make -j$(nproc) && make install
+          sed -i \
+            -e "s|^CC=.*|CC=aarch64-linux-android${ANDROID_API}-clang|" \
+            -e "s|^AR=.*|AR=llvm-ar|" \
+            -e "s|^RANLIB=.*|RANLIB=llvm-ranlib|" \
+            -e "s|^LDSHARED=.*|LDSHARED=aarch64-linux-android${ANDROID_API}-clang -shared|" \
+            -e "s|^CPP=.*|CPP=aarch64-linux-android${ANDROID_API}-clang -E|" \
+            Makefile
+          make -j$(nproc)
+          make install
 
-      # 4) OpenSSL
+      # 4) 交叉编译 OpenSSL 3.5.1
       - name: Build OpenSSL
         run: |
           cd "$SRC_DIR/openssl-${OPENSSL_VER}"
+          export ANDROID_NDK_ROOT="$NDK_ROOT"
+          export TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
+          export PATH="$TOOLCHAIN/bin:$PATH"
           export CC=aarch64-linux-android${ANDROID_API}-clang
           export AR=llvm-ar
           export RANLIB=llvm-ranlib
+          export CFLAGS="-fPIC -D__ANDROID_API__=$ANDROID_API"
           ./Configure android-arm64 \
-            --prefix="$(pwd)/out" no-asm no-shared \
+            --prefix="$(pwd)/out" \
+            no-asm no-shared \
             -D__ANDROID_API__=$ANDROID_API
-          make -j$(nproc) && make install_sw
+          make -j$(nproc)
+          make install_sw
 
-      # 5) 宿主 Python
+      # 5) 本地同版本 Python（供交叉阶段使用）
       - name: Build host Python
         run: |
           cd "$SRC_DIR/Python-${PYTHON_VER}"
-          mkdir host-build && cd host-build
-          ../configure --prefix="$(pwd)/../host-out" --enable-optimizations
+          mkdir -p host-build host-out
+          cd host-build
+          ../configure --prefix="$(pwd)/../host-out" \
+            --enable-optimizations --with-ensurepip=no
           make -j$(nproc) && make install
+          make clean
 
-      # 6) 交叉编译 Python
+      # 6) 交叉编译 Python 3.11
       - name: Cross-compile Python
         run: |
           cd "$SRC_DIR/Python-${PYTHON_VER}"
-          mkdir cross-build && cd cross-build
-          export READELF=/usr/bin/readelf
+          mkdir -p cross-build
+          cd cross-build
+          export PATH="$SRC_DIR/Python-${PYTHON_VER}/host-out/bin:$PATH"
           ../configure \
             --host=aarch64-linux-android \
             --build=x86_64-pc-linux-gnu \
             --prefix="$OUT_DIR" \
-            --with-build-python="$HOST_PY" \
+            --with-build-python="$SRC_DIR/Python-${PYTHON_VER}/host-out/bin/python3" \
             --with-openssl="$SRC_DIR/openssl-${OPENSSL_VER}/out" \
             --enable-ipv6 \
             ac_cv_file__dev_ptmx=yes \
             ac_cv_file__dev_ptc=no \
+            READELF=/usr/bin/readelf \
             CFLAGS="-D__ANDROID_API__=$ANDROID_API -fPIC" \
-            LDFLAGS="-L$SRC_DIR/zlib-${ZLIB_VER}/out/lib -L$SRC_DIR/openssl-${OPENSSL_VER}/out/lib" \
-            CPPFLAGS="-I$SRC_DIR/zlib-${ZLIB_VER}/out/include -I$SRC_DIR/openssl-${OPENSSL_VER}/out/include"
-          sed -i -e 's|^#SSL=|SSL=|' -e 's|^#_ssl|_ssl|' -e 's|^#zlib|zlib|' ../Modules/Setup
-          make -j$(nproc) && make install
+            LDFLAGS="-Wl,--allow-shlib-undefined -L$SRC_DIR/zlib-${ZLIB_VER}/out/lib -L$SRC_DIR/openssl-${OPENSSL_VER}/out/lib" \
+            CPPFLAGS="-D__ANDROID_API__=$ANDROID_API -I$SRC_DIR/zlib-${ZLIB_VER}/out/include -I$SRC_DIR/openssl-${OPENSSL_VER}/out/include"
+          # 启用 _ssl、zlib
+          sed -i \
+            -e 's|^#SSL=|SSL=|' \
+            -e 's|^#_ssl|_ssl|' \
+            -e 's|^#zlib|zlib|' \
+            ../Modules/Setup
+          make -j$(nproc)
+          make install
 
-      # 7) 打包上传
+      # 7) 打包
       - name: Package
         run: |
           cd "$OUT_DIR"
           tar -czf ../python3-android-aarch64-${PYTHON_VER}.tar.gz .
+          ls -lh ../python3-android-aarch64-${PYTHON_VER}.tar.gz
+
+      # 8) 上传 Artifact
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: python3-android-aarch64-${{ env.PYTHON_VER }}
           path: python3-android-aarch64-${{ env.PYTHON_VER }}.tar.gz
 
-      # 8) Release（仅在推送 tag 时）
+      # 9) （可选）Release
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
