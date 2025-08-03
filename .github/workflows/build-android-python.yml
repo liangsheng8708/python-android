@@ -122,6 +122,7 @@ jobs:
             --host=aarch64-linux-android \
             --build=x86_64-pc-linux-gnu \
             --prefix="$OUT_DIR" \
+            --with-build-python="$SRC_DIR/Python-${PYTHON_VER}/host-out/bin/python3" \
             --with-openssl="$SRC_DIR/openssl-${OPENSSL_VER}/out" \
             --enable-ipv6 \
             ac_cv_file__dev_ptmx=yes \
