@@ -99,6 +99,7 @@ jobs:
             -D__ANDROID_API__=$ANDROID_API
           make -j$(nproc)
           make install_sw
+          make install_dev          # <-- 新增：安装 pkg-config 与头文件
 
       # 5) 本地同版本 Python（供交叉阶段使用）
       - name: Build host Python
@@ -118,7 +119,7 @@ jobs:
           mkdir -p cross-build
           cd cross-build
           export PATH="$SRC_DIR/Python-${PYTHON_VER}/host-out/bin:$PATH"
-          export PKG_CONFIG_PATH="$SRC_DIR/openssl-${OPENSSL_VER}/out/lib/pkgconfig:$PKG_CONFIG_PATH"
+          export PKG_CONFIG_PATH="$SRC_DIR/openssl-${OPENSSL_VER}/out/lib/pkgconfig:$PKG_CONFIG_PATH"   # <-- 新增
           ../configure \
             --host=aarch64-linux-android \
             --build=x86_64-pc-linux-gnu \
