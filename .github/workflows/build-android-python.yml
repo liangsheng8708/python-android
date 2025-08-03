@@ -1,0 +1,157 @@
+name: Build Python 3.11 for Android (aarch64)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ "v*" ]
+  pull_request:
+    paths: [ ".github/workflows/build-android-python.yml" ]
+
+env:
+  PYTHON_VER:   3.11.10
+  NDK_VER:      27.0.12479018          # r27d 的 build-id
+  ZLIB_VER:     1.3.1
+  OPENSSL_VER:  3.5.1
+  LIBRESSL_VER: 4.1.0
+  ANDROID_API:  34                     # r27d 默认最低 21，这里用 34 方便新特性
+  PREFIX:       /opt/android-python
+  NDK_ROOT:     /opt/android-ndk
+  SRC_DIR:      ${{ github.workspace }}/src
+  BUILD_DIR:    ${{ github.workspace }}/build
+  OUT_DIR:      ${{ github.workspace }}/out
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential \
+            libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+            wget curl llvm libncurses5-dev libncursesw5-dev xz-utils tk-dev \
+            libffi-dev liblzma-dev git libgdbm-dev libdb-dev libexpat1-dev \
+            unzip ninja-build
+
+      # 1) 下载并解压所有源码
+      - name: Download sources
+        run: |
+          mkdir -p "$SRC_DIR"
+          cd "$SRC_DIR"
+          wget --retry-connrefused --waitretry=2 -t 10 -q \
+            https://www.python.org/ftp/python/${PYTHON_VER}/Python-${PYTHON_VER}.tar.xz
+          wget --retry-connrefused --waitretry=2 -t 10 -q \
+            https://zlib.net/fossils/zlib-${ZLIB_VER}.tar.gz
+          wget --retry-connrefused --waitretry=2 -t 10 -q \
+            https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz
+          wget --retry-connrefused --waitretry=2 -t 10 -q \
+            https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-${LIBRESSL_VER}.tar.gz
+          tar -xf Python-${PYTHON_VER}.tar.xz
+          tar -xf zlib-${ZLIB_VER}.tar.gz
+          tar -xf openssl-${OPENSSL_VER}.tar.gz
+          tar -xf libressl-${LIBRESSL_VER}.tar.gz
+
+      # 2) Android NDK
+      - name: Install Android NDK
+        run: |
+          mkdir -p "$NDK_ROOT"
+          cd /tmp
+          wget --retry-connrefused --waitretry=2 -t 10 -q \
+               https://googledownloads.cn/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d/* "$NDK_ROOT"
+          echo "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      # 3) 交叉编译 zlib
+      - name: Build zlib
+        run: |
+          cd "$SRC_DIR/zlib-${ZLIB_VER}"
+          mkdir -p build out
+          cd build
+          ../configure --prefix="$(pwd)/../out"
+          sed -i \
+            -e "s|^CC=.*|CC=aarch64-linux-android${ANDROID_API}-clang|" \
+            -e "s|^AR=.*|AR=llvm-ar|" \
+            -e "s|^RANLIB=.*|RANLIB=llvm-ranlib|" \
+            -e "s|^LDSHARED=.*|LDSHARED=aarch64-linux-android${ANDROID_API}-clang -shared|" \
+            -e "s|^CPP=.*|CPP=aarch64-linux-android${ANDROID_API}-clang -E|" \
+            Makefile
+          make -j$(nproc)
+          make install
+
+      # 4) 交叉编译 OpenSSL 3.5.1
+      - name: Build OpenSSL
+        run: |
+          cd "$SRC_DIR/openssl-${OPENSSL_VER}"
+          mkdir -p build out
+          ./Configure android-arm64 \
+            --prefix="$(pwd)/out" \
+            no-asm no-shared \
+            -D__ANDROID_API__=$ANDROID_API
+          make -j$(nproc)
+          make install_sw
+
+      # 5) 本地同版本 Python（供交叉阶段使用）
+      - name: Build host Python
+        run: |
+          cd "$SRC_DIR/Python-${PYTHON_VER}"
+          mkdir -p host-build host-out
+          cd host-build
+          ../configure --prefix="$(pwd)/../host-out" \
+            --enable-optimizations --with-ensurepip=no
+          make -j$(nproc) && make install
+          make clean
+
+      # 6) 交叉编译 Python 3.11
+      - name: Cross-compile Python
+        run: |
+          cd "$SRC_DIR/Python-${PYTHON_VER}"
+          mkdir -p cross-build
+          cd cross-build
+          export PATH="$SRC_DIR/Python-${PYTHON_VER}/host-out/bin:$PATH"
+          ../configure \
+            --host=aarch64-linux-android \
+            --build=x86_64-pc-linux-gnu \
+            --prefix="$OUT_DIR" \
+            --with-openssl="$SRC_DIR/openssl-${OPENSSL_VER}/out" \
+            --enable-ipv6 \
+            ac_cv_file__dev_ptmx=yes \
+            ac_cv_file__dev_ptc=no \
+            CFLAGS="-D__ANDROID_API__=$ANDROID_API -fPIC" \
+            LDFLAGS="-Wl,--allow-shlib-undefined -L$SRC_DIR/zlib-${ZLIB_VER}/out/lib -L$SRC_DIR/openssl-${OPENSSL_VER}/out/lib" \
+            CPPFLAGS="-D__ANDROID_API__=$ANDROID_API -I$SRC_DIR/zlib-${ZLIB_VER}/out/include -I$SRC_DIR/openssl-${OPENSSL_VER}/out/include"
+          # 启用 _ssl、zlib
+          sed -i \
+            -e 's|^#SSL=|SSL=|' \
+            -e 's|^#_ssl|_ssl|' \
+            -e 's|^#zlib|zlib|' \
+            ../Modules/Setup
+          make -j$(nproc)
+          make install
+
+      # 7) 打包
+      - name: Package
+        run: |
+          cd "$OUT_DIR"
+          tar -czf ../python3-android-aarch64-${PYTHON_VER}.tar.gz .
+          ls -lh ../python3-android-aarch64-${PYTHON_VER}.tar.gz
+
+      # 8) 上传 Artifact
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python3-android-aarch64-${{ env.PYTHON_VER }}
+          path: python3-android-aarch64-${{ env.PYTHON_VER }}.tar.gz
+
+      # 9) （可选）Release
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: python3-android-aarch64-${{ env.PYTHON_VER }}.tar.gz
+          tag_name: ${{ github.ref_name }}
+          name: Python ${{ env.PYTHON_VER }} for Android (aarch64)
+          generate_release_notes: true
